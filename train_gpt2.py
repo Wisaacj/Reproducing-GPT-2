@@ -1,3 +1,4 @@
+import time
 import sys
 import tiktoken
 import math
@@ -48,15 +49,20 @@ class CausalSelfAttention(nn.Module):
                    self.n_head).transpose(1, 2)  # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C //
                    self.n_head).transpose(1, 2)  # (B, nh, T, hs)
-        # Attention (materialises the large (T, T) attention matrix for all the queries and keys)
-        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-        # This autoregressive mask makes sure that the tokens only attend to tokens before them
-        # and never to tokens in the future.
-        att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
-        att = F.softmax(att, dim=-1)
-        # Recall that attention multipled by the values is basically a way of doing a weighted
-        # sum of the values (the attention scores sum to 1).
-        y = att @ v  # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+
+        # # Attention (materialises the large (T, T) attention matrix for all the queries and keys)
+        # att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+        # # This autoregressive mask makes sure that the tokens only attend to tokens before them
+        # # and never to tokens in the future.
+        # att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
+        # att = F.softmax(att, dim=-1)
+        # # Recall that attention multipled by the values is basically a way of doing a weighted
+        # # sum of the values (the attention scores sum to 1).
+        # y = att @ v  # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+
+        # Flash attention
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         # Output projection
         y = self.c_proj(y)
@@ -159,8 +165,8 @@ class GPT(nn.Module):
         # The input to the foward pass is a sequence of token indices.
         # idx is of shape (B, T)
         B, T = idx.size()
-        assert T <= self.config.block_size, f"Cannot forward sequence of length {
-            T}, block size is only {self.config.block_size}"
+        assert T <= self.config.block_size, f"""Cannot forward sequence of length {
+            T}, block size is only {self.config.block_size}"""
         # Forward the token and positional embeddings
         pos = torch.arange(0, T, dtype=torch.long,
                            device=idx.device)  # Shape (T,)
@@ -230,8 +236,8 @@ class GPT(nn.Module):
 
         # Basically, the OpenAI checkpoints ue a "Conv1D" module, but we only want to use a vanilla module.
         # This means we have to tranpose these weights when we import them.
-        assert len(sd_keys_hf) == len(sd_keys), f"mismatched keys: {
-            len(sd_keys_hf)} != {len(sd_keys)}"
+        assert len(sd_keys_hf) == len(sd_keys), f"""mismatched keys: {
+            len(sd_keys_hf)} != {len(sd_keys)}"""
         for k in sd_keys_hf:
             if any(k.endswith(w) for w in tranposed):
                 # Special treatment for the Conv1D weights we need to tranpose
@@ -290,29 +296,46 @@ elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
     device = "mps"
 print(f"using device: {device}")
 
-torch.manual_seed(42)
+torch.manual_seed(1337)
 if torch.cuda.is_available():
-    torch.cuda.manual_seed(42)
+    torch.cuda.manual_seed(1337)
 
 # Get a data batch
-train_loader = DataLoaderLite(4, 32)
+train_loader = DataLoaderLite(B=8, T=1024)
+
+# Enable TF32 for faster training
+torch.set_float32_matmul_precision('high')
 
 # Get logits
-model = GPT(GPTConfig())
+model = GPT(GPTConfig(vocab_size=50304))
 model.to(device)
+model = torch.compile(model)
 
 # AdamW is a bug fix for Adam. It's the same as Adam, but with a different weight decay.
-optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+optimizer = torch.optim.AdamW(
+    model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)
 for i in range(50):
+    t0 = time.time()
     x, y = train_loader.next_batch()
     x, y = x.to(device), y.to(device)
     optimizer.zero_grad()
-    logits, loss = model(x, y)
+    # https://pytorch.org/tutorials/recipes/recipes/amp_recipe.html#adding-torch-autocast
+    with torch.autocast(device_type=device, dtype=torch.bfloat16):
+        logits, loss = model(x, y)
     # .backward deposits gradients: it accumulates the gradients from the loss
     loss.backward()
+    # Gradient clipping is a technique to prevent exploding gradients in very deep networks.
+    # A very bad batch of data can cause the gradients to explode and the model to fail to train.
+    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     # Calling .step() updates the parameters based on the gradients.
     optimizer.step()
-    print(f"step {i}, loss: {loss.item()}")
+    # Wait for the GPU to finish all work scheduled to run.
+    torch.cuda.synchronize()
+    t1 = time.time()
+    dt = (t1 - t0)*1000  # Time difference in milliseconds
+    tokens_per_sec = (train_loader.B * train_loader.T) / (t1 - t0)
+    print(f"""step {i} | loss: {loss.item():.6f} | norm: {norm:.4f} | dt: {
+          dt:.2f}ms | tok/sec: {tokens_per_sec:.2f}""".replace("\n", ""))
 
 sys.exit(0)
 
@@ -340,7 +363,7 @@ while x.size(1) < max_length:
     # inference faster and reduces the memory consumption.
     with torch.no_grad():
         logits = model(x)  # (B, T, vocab_size)
-        # Take the logtis at the last position
+        # Take the logits at the last position
         logits = logits[:, -1, :]  # (B, vocab_size)
         # Get the probabilities
         prob = F.softmax(logits, dim=-1)
